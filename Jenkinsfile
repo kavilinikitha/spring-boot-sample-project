@@ -1,23 +1,85 @@
 pipeline {
     agent any
 
+    environment {
+        APP_NAME    = "springboot-app"
+        APP_DIR     = "/opt/${APP_NAME}"
+        DEPLOY_USER = "ubuntu"
+        DEPLOY_HOST = "44.203.106.7"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
     stages {
+
         stage('Checkout') {
             steps {
                 checkout scm
             }
         }
 
-        stage('Build') {
+        stage('Build & Test') {
             steps {
-                sh 'mvn clean package'
+                sh 'mvn clean test'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
+                }
             }
         }
 
-        stage('Deploy') {
+        stage('Package JAR') {
             steps {
-                echo 'Deploy steps go here'
+                sh '''
+                    mvn clean package -DskipTests
+                    ls -lh target/*.jar
+                '''
             }
+        }
+
+        stage('Security Scan (Trivy)') {
+            steps {
+                sh '''
+                    trivy fs --exit-code 0 --format json \
+                    --output trivy-report.json .
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.json', fingerprint: true
+                }
+            }
+        }
+
+        stage('Deploy to App EC2 (main only)') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sshagent(['asst-1']) {
+
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${DEPLOY_HOST} "mkdir -p /opt/springboot-app"
+                        scp -o StrictHostKeyChecking=no target/*.jar ubuntu@${DEPLOY_HOST}:/opt/springboot-app/app.jar
+                        ssh -o StrictHostKeyChecking=no ubuntu@${DEPLOY_HOST} "pkill -f app.jar" || true
+                        ssh -o StrictHostKeyChecking=no ubuntu@${DEPLOY_HOST} "nohup java -jar /opt/springboot-app/app.jar > /opt/springboot-app/app.log 2>&1 &"
+                        """
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "SUCCESS on branch ${env.BRANCH_NAME}"
+        }
+        failure {
+            echo "FAILED on branch ${env.BRANCH_NAME}"
         }
     }
 }
